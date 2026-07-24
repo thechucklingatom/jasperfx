@@ -45,12 +45,21 @@ internal sealed class JasperFxCommandExecutor
         {
             environment = await ResolveEnvironmentAsync(context, logger);
         }
+        catch (OperationCanceledException)
+        {
+            return CommandResults.Canceled();
+        }
         catch (Exception e)
         {
-            logger.LogWarning(e,
-                "Unable to resolve the Aspire-managed environment for '{Resource}'; the child process will inherit the AppHost environment only.",
+            // Per-callback failures are already tolerated inside ResolveEnvironmentAsync; reaching here
+            // means resolution could not run at all (e.g. a missing DistributedApplicationExecutionContext
+            // service). That is a misconfiguration, not a degraded environment — fail loudly rather than
+            // silently launching the child with only the AppHost environment and a mysterious downstream
+            // startup crash.
+            logger.LogError(e,
+                "Unable to resolve the Aspire-managed environment for '{Resource}'; aborting the JasperFx command.",
                 context.ResourceName);
-            environment = new Dictionary<string, string>();
+            return CommandResults.Failure(e);
         }
 
         var startInfo = BuildStartInfo(projectPath, workingDirectory, _verb, _arguments, environment);
@@ -78,29 +87,88 @@ internal sealed class JasperFxCommandExecutor
     /// Aspire-managed connection strings and explicit <c>WithEnvironment</c> values. The spawned child
     /// also inherits the AppHost process environment (ProcessStartInfo default), so these add on top.
     /// </summary>
-    private async Task<IReadOnlyDictionary<string, string>> ResolveEnvironmentAsync(
+    private Task<IReadOnlyDictionary<string, string>> ResolveEnvironmentAsync(
         ExecuteCommandContext context, ILogger logger)
     {
         var executionContext = context.ServiceProvider.GetRequiredService<DistributedApplicationExecutionContext>();
-        var callbackContext = new EnvironmentCallbackContext(executionContext, cancellationToken: context.CancellationToken);
+        return ResolveEnvironmentAsync(_resource, executionContext, logger, context.CancellationToken);
+    }
 
-        foreach (var annotation in _resource.Annotations.OfType<EnvironmentCallbackAnnotation>())
+    /// <summary>
+    /// Evaluate a resource's <see cref="EnvironmentCallbackAnnotation"/>s against an
+    /// <see cref="EnvironmentCallbackContext"/> that is associated with the resource. The resource
+    /// association matters: Aspire's own callbacks (e.g. the endpoint/reference population added by
+    /// <c>WithReference</c>) read <see cref="EnvironmentCallbackContext.Resource"/>, which throws
+    /// "Resource is not set" when the context is built without one — leaving connection strings and
+    /// other Aspire-managed variables unresolved (see GH #560).
+    /// </summary>
+    internal static async Task<IReadOnlyDictionary<string, string>> ResolveEnvironmentAsync(
+        IResource resource,
+        DistributedApplicationExecutionContext executionContext,
+        ILogger logger,
+        CancellationToken cancellationToken)
+    {
+        var callbackContext = new EnvironmentCallbackContext(executionContext, resource, cancellationToken: cancellationToken);
+
+        // Resolution is best-effort and resilient per-item: one failing callback or unresolvable value
+        // must not discard everything else that resolved successfully. A single broken WithReference
+        // used to leave the child process with an empty environment (see GH #560); now we keep what we
+        // can and report the shortfall. Cancellation still propagates.
+        var failures = 0;
+        foreach (var annotation in resource.Annotations.OfType<EnvironmentCallbackAnnotation>())
         {
-            await annotation.Callback(callbackContext);
+            try
+            {
+                await annotation.Callback(callbackContext);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception e)
+            {
+                failures++;
+                logger.LogWarning(e,
+                    "An Aspire environment callback failed for '{Resource}'; continuing with the remaining callbacks. Some environment variables may be missing.",
+                    resource.Name);
+            }
         }
 
         var resolved = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var (key, rawValue) in callbackContext.EnvironmentVariables)
         {
-            var value = await ResolveValueAsync(rawValue, context.CancellationToken);
-            if (value != null)
+            try
             {
-                resolved[key] = value;
+                var value = await ResolveValueAsync(rawValue, cancellationToken);
+                if (value != null)
+                {
+                    resolved[key] = value;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception e)
+            {
+                failures++;
+                logger.LogWarning(e,
+                    "Unable to resolve the value of environment variable '{Key}' for '{Resource}'; it will be omitted from the JasperFx command child process.",
+                    key, resource.Name);
             }
         }
 
-        logger.LogInformation("Resolved {Count} environment variable(s) for the JasperFx command child process.",
-            resolved.Count);
+        if (failures > 0)
+        {
+            logger.LogWarning(
+                "Resolved {Count} environment variable(s) for the JasperFx command child process with {Failures} failure(s); the child may be missing some Aspire-managed configuration.",
+                resolved.Count, failures);
+        }
+        else
+        {
+            logger.LogInformation("Resolved {Count} environment variable(s) for the JasperFx command child process.",
+                resolved.Count);
+        }
 
         return resolved;
     }

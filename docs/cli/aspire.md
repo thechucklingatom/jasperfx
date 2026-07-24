@@ -133,9 +133,18 @@ dotnet run --project <api>.csproj --no-build -- <verb> <args>
 
 The child inherits the AppHost's environment, and on top of that the resource's *resolved*
 environment is applied — evaluated from the resource's Aspire environment annotations (the same
-values Aspire injects into the running process, such as `ConnectionStrings__*`). The child's
-`stdout`/`stderr` stream into the resource's **Console logs** in the dashboard, and its exit code
-maps to a success or failure toast.
+values Aspire injects into the running process, such as `ConnectionStrings__*`). Those annotations
+are evaluated against a callback context that is **associated with the resource**, so Aspire's own
+reference/endpoint population (everything a `WithReference(...)` contributes) resolves correctly
+rather than failing to find its resource. The child's `stdout`/`stderr` stream into the resource's
+**Console logs** in the dashboard, and its exit code maps to a success or failure toast.
+
+Environment resolution is **resilient per variable**: if an individual annotation callback throws or
+a single value can't be resolved, that one variable is logged and skipped while every other variable
+still flows through — a single broken reference never blanks out the whole environment. If resolution
+can't run **at all** (a genuine misconfiguration, such as a missing Aspire execution context), the
+command **fails loudly** with the error in the dashboard rather than silently launching the child
+against a half-populated environment.
 
 ```mermaid
 sequenceDiagram
